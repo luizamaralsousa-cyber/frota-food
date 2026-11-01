@@ -1,0 +1,133 @@
+---
+description: Convenções obrigatórias do Frota Food (stack, banco multi-tenant com RLS, eventos, tempo real, segurança). Fonte: Manuais por Etapas Partes 1–6 e Plano Técnico.
+globs:
+alwaysApply: true
+---
+
+# Frota Food — regras do projeto
+
+SaaS de gestão e delivery para restaurantes. Monólito modular em NestJS, multi-tenant por **conta** (rede/dono) e **loja** (unidade).
+Responda e comente código em **português do Brasil**. Nomes de tabelas, colunas, funções e variáveis de domínio também em português (`pedidos`, `conta_id`, `registrarFalha`), sem acentos.
+
+Se um pedido conflitar com estas regras, **pare e avise** em vez de contornar a regra.
+
+## 1. Stack (versões fixas — não trocar sem pedido explícito)
+
+- Node.js 22 (NVM, `.nvmrc`), pnpm 9.15.0, Turborepo, TypeScript estrito.
+- NestJS 11 + Fastify 5, logs com nestjs-pino (JSON, sem `console.log`).
+- Drizzle ORM 0.44 + drizzle-kit 0.31.
+- PostgreSQL 16 + PostGIS 3, PgBouncer em modo **transaction**.
+- Redis 7.4 (`noeviction`), BullMQ 5 + ioredis.
+- Socket.IO com `@socket.io/redis-adapter` e `@socket.io/redis-emitter`.
+- Evolution API `evoapicloud/evolution-api:v2.3.0` (única peça em Docker).
+- Tauri 2 (Frota Hub), Vite (PWA), Astro (site), Vitest (testes).
+
+Não adicionar dependências novas sem justificar e pedir confirmação. Nunca trocar Drizzle por outro ORM, Fastify por Express ou BullMQ por outra fila.
+
+## 2. Estrutura do monorepo
+
+- `apps/api`: NestJS (REST + Socket.IO + workers)
+- `apps/pdv`: PWA (PDV, KDS, painel) - Vite
+- `apps/hub`: Frota Hub - Tauri 2
+- `apps/site`: site - Astro
+- `apps/ia`: previsão de estoque
+- `packages/db`: schema e migrações Drizzle
+- `packages/dominio`: regras puras (máquina de estados, trial, estoque) - sem I/O
+- `infra/sql`, `infra/scripts`, `infra/evolution`, `infra/dev/snapshots`
+
+- Regra de negócio pura vai em `packages/dominio` (sem banco, sem Nest, testável isolada). `apps/api` só orquestra.
+- Cada módulo Nest expõe um serviço público; módulos não acessam tabelas uns dos outros diretamente.
+
+## 3. Ambiente local (Ubuntu nativo — mesmas portas da VPS)
+
+| Serviço | Endereço | Usuário / senha dev |
+|---|---|---|
+| PostgreSQL (migrações, scripts) | `localhost:5432` | `frota_owner` / `dev_owner` |
+| PgBouncer (API e workers) | `127.0.0.1:6432` | `frota_app` / `dev_app` |
+| Redis | `127.0.0.1:6379` | senha `dev_redis` (testes usam o banco 15) |
+| Evolution API | `127.0.0.1:8080` | banco `evolution` / `dev_evo` |
+| API | `http://localhost:3000` | — |
+| PWA (Vite, `strictPort`) | `http://localhost:5173` | — |
+| Hub (Tauri / servidor local) | `1420` / `7420` | — |
+
+Bancos: `frotafood_dev`, `frotafood_teste`, `evolution`. Nunca sugerir WSL, Docker Desktop, docker-compose para a stack ou portas diferentes destas.
+Validar o ambiente com `pnpm stack:validar`.
+
+## 4. Banco de dados — regras invioláveis
+
+### Papéis
+- `frota_owner`: dono das tabelas; usado **só** por migrações e scripts de manutenção (conexão direta na 5432).
+- `frota_app`: usado pela API e pelos workers; `NOBYPASSRLS`; conecta pelo PgBouncer (6432).
+- Nunca usar `frota_owner` no código da aplicação. Nunca dar `BYPASSRLS` a ninguém.
+
+### Isolamento multi-tenant (RLS)
+- Toda tabela de negócio tem `conta_id uuid NOT NULL` (e `loja_id` quando pertence a uma loja).
+- Toda tabela de negócio tem `ENABLE ROW LEVEL SECURITY` **e** `FORCE ROW LEVEL SECURITY`, com as políticas:
+  - `<tabela>_isolamento` para `frota_app`: `USING (conta_id = app_conta_atual()) WITH CHECK (conta_id = app_conta_atual())`
+  - `<tabela>_manutencao` para `frota_owner`: `USING (true) WITH CHECK (true)`
+- O tenant é definido **dentro de uma transação**: `SELECT set_config('app.current_conta_id', $1, true)`. O terceiro argumento `true` é obrigatório (vale só para a transação, seguro com PgBouncer em modo transaction).
+- Proibido `SET` de sessão, `SET app.current_conta_id` sem `LOCAL`, prepared statements nomeados ou qualquer estado de sessão.
+- Toda consulta da aplicação passa pelo helper de transação com tenant; nunca consultar fora dele.
+- Chaves estrangeiras entre tabelas de negócio são **compostas** `(id, conta_id)`, para impedir ligar registros de contas diferentes.
+- Grants mínimos: conceder só o que a tabela precisa (ex.: eventos e telemetria só `SELECT, INSERT`).
+
+### Funções SECURITY DEFINER
+- Operações que precisam enxergar além do tenant (login, pareamento de aparelho, refresh, criação de conta, outbox) usam funções `SECURITY DEFINER` com `SET search_path = public, pg_temp`, `REVOKE ALL ... FROM PUBLIC` e `GRANT EXECUTE` só para `frota_app`.
+- Existentes: `auth_usuario_por_email`, `auth_aparelho_por_token`, `auth_sessao_por_refresh`, `identidade_criar_conta`, `outbox_reservar`, `outbox_confirmar`, `outbox_registrar_falha`.
+
+### IDs, tipos e valores
+- Chave primária: `uuid DEFAULT uuid_generate_v7()`. Nunca serial/bigserial nem UUIDv4.
+- Dinheiro sempre em **centavos inteiros** (`*_centavos integer`). Nunca float para dinheiro.
+- Datas em `timestamptz`. Fuso de negócio: `America/Sao_Paulo`.
+
+### Migrações (Drizzle)
+- Migrações SQL manuais: `drizzle-kit generate --custom --name <nome>`, com `--> statement-breakpoint` entre comandos.
+- **Nunca editar uma migração já aplicada**: criar uma nova.
+- Toda migração que cria tabela de negócio já inclui RLS, FORCE, políticas e grants na mesma migração.
+- O esquema tem que recriar do zero: testar com `infra/scripts/resetar-banco.sh` antes de commitar.
+- Depois de criar tabelas, conferir que nenhuma tabela de negócio ficou sem RLS:
+  `SELECT relname FROM pg_class WHERE relnamespace='public'::regnamespace AND relkind='r' AND NOT relforcerowsecurity;`
+
+## 5. Pedidos, eventos e filas
+
+- `pedido_eventos` é **append-only** (sem UPDATE/DELETE para `frota_app`). O status do pedido é projetado pelo gatilho `pedido_aplicar_status`; a aplicação nunca faz `UPDATE pedidos SET status`.
+- A máquina de estados vive em `packages/dominio` (`transicaoPermitida`) e espelha a função SQL `pedido_transicao_valida`. Qualquer mudança nas transições altera **as duas** e mantém o teste de paridade passando.
+- Transição inválida: HTTP 409 com os estados permitidos; cancelamento exige motivo (422 `motivo_obrigatorio`).
+- Efeitos externos (WhatsApp, iFood, KDS, fiscal) saem pelo **outbox**: grava-se na tabela `outbox` na mesma transação do fato; o publicador usa `outbox_reservar` (SKIP LOCKED), `outbox_confirmar` (passar o array como `uuid[]` via `pool.query`) e `outbox_registrar_falha`.
+- Todo consumidor é **idempotente** (chave de idempotência = ID do evento/webhook). Movimentos de estoque usam índice único parcial para não duplicar.
+- Jobs BullMQ: tentativas com backoff, sem perda silenciosa. Redis com `noeviction`: nunca guardar cache volumoso nele.
+
+## 6. Tempo real
+
+- Socket.IO no namespace `/tempo-real`, adapter Redis com chave `frota-io`.
+- Workers emitem via `@socket.io/redis-emitter` (nunca importam o gateway).
+- Salas por loja; o cliente só entra na sala da própria loja depois de autenticado.
+
+## 7. Regras de negócio já decididas
+
+- **Trial**: conta nasce em `implantacao`; o trial (`piloto_60` = 60 dias, `escala_30` = 30 dias) começa **somente na primeira venda real finalizada** (pedido de treino não conta). A ativação roda numa transação com `SELECT ... FOR UPDATE` e `SET LOCAL lock_timeout = '5s'`, muda para `trial_ativo` e registra `trial.iniciado`. A regra pura fica em `packages/dominio`.
+- **Estoque**: explosão da ficha técnica com perda técnica: `bruta = liquida / (1 - perda)`; sub-receitas (preparos) por rendimento; adicionais têm ficha própria.
+- **PIN do operador** (script Lua atômico no Redis): 5 erros por (estação, operador) → bloqueio de 5 min; 15 erros por estação → bloqueia a estação inteira. Resposta HTTP 423 com `Retry-After`. PIN fraco é recusado.
+- **Integrações** com modo simulado: `IFOOD_MODO=simulado|real`, `WHATSAPP_MODO=simulado|real`. Todo adaptador externo tem implementação falsa para desenvolvimento offline.
+
+## 8. API e configuração
+
+- Rotas sob `/api/v1`. Erros no formato `{ "erro": { "codigo": "...", "mensagem": "...", "detalhes": {} } }`.
+- Variáveis de ambiente validadas com **zod** na partida; faltou variável = a API não sobe.
+- JWT: expiração em segundos (`JWT_EXPIRACAO_ACESSO_SEG`); refresh por cookie `SameSite=Strict`.
+- PWA chama caminhos relativos (`/api`, `/socket.io`) via proxy do Vite/Nginx. CORS só por lista explícita em `CORS_ORIGINS`.
+- Hub em produção usa HTTPS com nome próprio por loja e certificado válido; nunca certificado autoassinado.
+
+## 9. Segurança e dados
+
+- Nunca ler, imprimir, commitar ou inventar valores de `.env`, senhas, tokens, certificados A1 ou chaves do iFood. Use `.env.example` com chaves sem valor.
+- Nunca enfraquecer RLS, grants, validação de assinatura de webhook ou o bloqueio de PIN para "fazer funcionar".
+- Banco local só com dados fictícios (LGPD).
+- Sem SQL concatenado com entrada do usuário: sempre parâmetros.
+
+## 10. Testes e entrega
+
+- Toda regra nova em `packages/dominio` vem com teste Vitest.
+- Mudança em banco/RLS vem com teste de isolamento: a conta A não lê nem grava nada da conta B.
+- Antes de dizer que terminou: `pnpm build` e `pnpm test` passando.
+- Mudanças pequenas e focadas; não reformatar nem renomear o que não foi pedido.

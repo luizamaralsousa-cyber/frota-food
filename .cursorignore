@@ -1,0 +1,19 @@
+# Segredos: a IA do Cursor não lê estes arquivos
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Dados locais e pesados
+infra/dev/snapshots/
+*.dump
+node_modules/
+dist/
+.turbo/
+apps/hub/src-tauri/target/
