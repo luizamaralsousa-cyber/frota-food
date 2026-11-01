@@ -1,0 +1,17 @@
+{
+  "name": "frota-food",
+  "private": true,
+  "packageManager": "pnpm@9.15.0",
+  "engines": { "node": ">=22 <23" },
+  "scripts": {
+    "stack:status": "systemctl is-active postgresql@16-main pgbouncer redis-server docker && docker ps --filter name=frota-evolution --format '{{.Names}} {{.Status}}'",
+    "stack:validar": "bash infra/scripts/validar.sh",
+    "db:psql": "psql postgresql://frota_owner:dev_owner@localhost:5432/frotafood_dev",
+    "db:snapshot": "bash infra/scripts/snapshot.sh",
+    "db:restaurar": "bash infra/scripts/restaurar.sh",
+    "dev": "turbo run dev --parallel",
+    "build": "turbo run build",
+    "test": "turbo run test"
+  },
+  "devDependencies": { "turbo": "^2.3.0", "typescript": "^5.7.0" }
+}
